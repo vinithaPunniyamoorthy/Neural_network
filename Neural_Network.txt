@@ -1,0 +1,153 @@
+# ======================
+# INSTALL DEPENDENCIES
+# ======================
+!pip install nlpaug tensorflow keras nltk openpyxl --quiet
+
+import pandas as pd
+import re
+import string
+import nltk
+from nltk.corpus import stopwords
+
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+import nlpaug.augmenter.word as naw  # For augmentation
+
+# ======================
+# DOWNLOAD NLTK RESOURCES
+# ======================
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
+
+# ======================
+# UPLOAD FILE IN COLAB
+# ======================
+from google.colab import files
+
+print("Please upload your data file (Excel or CSV)")
+uploaded = files.upload()   # Upload the file manually
+
+# Get the uploaded file name
+file_name = list(uploaded.keys())[0]
+print(f"Uploaded file: {file_name}")
+
+# ======================
+# LOAD DATASET (with encoding fix)
+# ======================
+if file_name.endswith('.csv'):
+    try:
+        df = pd.read_csv(file_name, encoding='utf-8')
+    except UnicodeDecodeError:
+        df = pd.read_csv(file_name, encoding='latin1')  # fallback encoding
+elif file_name.endswith('.xlsx'):
+    try:
+        df = pd.read_excel(file_name, engine='openpyxl')
+    except Exception as e:
+        print(f"Error reading Excel file with openpyxl: {e}")
+        raise ValueError(f"Could not read Excel file. Please check the file format and content. Specific error: {e}")
+else:
+    raise ValueError("Unsupported file format. Please upload a .csv or .xlsx file.")
+
+
+# Rename columns for simplicity
+df = df.rename(columns={
+    'Please write a short text message when you were feeling HAPPY ? 😊\nE.g - "I got full marks on my test! So happy right now!"\n': 'happy',
+    'Please write a short text message when you were feeling SAD ?  😢\nE.g - "I studied hard but still failed… I feel really down."': 'sad',
+    'Please write a short text message when you were feeling ANGRY ?  😡\nE.g - "They blamed me for something I didn’t even do. I’m so angry !"': 'angry',
+    'Please write a short text message when you were feeling FEAR ? 😨\nE.g - "I have a exam tomorrow, and I’m scared I’ll fail."': 'fear'
+})
+
+# ======================
+# CLEAN TEXT FUNCTION
+# ======================
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'\d+', '', text)  # remove numbers
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text)  # remove emojis
+    text = re.sub(r'\s+', ' ', text).strip()
+    words = text.split()
+    filtered_words = [word for word in words if word not in stop_words]
+    return ' '.join(filtered_words)
+
+# ======================
+# DETECT GIBBERISH
+# ======================
+def is_gibberish(text):
+    text = str(text)
+    if len(text) < 4:
+        return True
+    if re.fullmatch(r'(.)\1{2,}', text):  # repeated chars
+        return True
+    if not re.search(r'[aeiouAEIOU]', text):  # no vowels
+        return True
+    if re.search(r'(?:[a-zA-Z]){5,}', text) and not re.search(r'\s', text):  # long word no spaces
+        return True
+    return False
+
+# ======================
+# MELT DATAFRAME INTO LONG FORMAT
+# ======================
+df_melted = df.melt(value_vars=['happy', 'sad', 'angry', 'fear'],
+                    var_name='emotion',
+                    value_name='text')
+
+# Remove empty values
+df_melted = df_melted.dropna(subset=['text'])
+df_melted = df_melted[df_melted['text'].str.strip() != '']
+
+# Clean and remove gibberish
+df_melted['cleaned_text'] = df_melted['text'].apply(clean_text)
+df_melted['is_gibberish'] = df_melted['cleaned_text'].apply(is_gibberish)
+df_clean = df_melted[df_melted['is_gibberish'] == False].copy()
+df_clean.drop(columns=['is_gibberish'], inplace=True)
+
+# ======================
+# DATA AUGMENTATION
+# ======================
+augmenter = naw.SynonymAug(aug_src='wordnet')
+AUGMENTATION_FACTOR = 4
+
+augmented_texts = []
+augmented_emotions = []
+
+for index, row in df_clean.iterrows():
+    original_text = row['cleaned_text']
+    emotion = row['emotion']
+    try:
+        augmented = augmenter.augment(original_text, n=AUGMENTATION_FACTOR)
+        if isinstance(augmented, list):
+            augmented_texts.extend(augmented)
+            augmented_emotions.extend([emotion]*len(augmented))
+        else:
+            augmented_texts.append(augmented)
+            augmented_emotions.append(emotion)
+    except Exception:
+        continue  # Skip errors
+
+# Create augmented dataframe
+df_aug = pd.DataFrame({
+    'emotion': augmented_emotions,
+    'cleaned_text': augmented_texts
+})
+
+# Combine original + augmented
+df_combined = pd.concat([df_clean[['emotion', 'cleaned_text']], df_aug], ignore_index=True)
+
+# ======================
+# TOKENIZATION + PADDING
+# ======================
+MAX_NUM_WORDS = 2000
+MAX_SEQUENCE_LENGTH = 20
+
+tokenizer = Tokenizer(num_words=MAX_NUM_WORDS, oov_token="<OOV>")
+tokenizer.fit_on_texts(df_combined['cleaned_text'])
+
+# Convert text → sequences
+df_combined['token_sequence'] = tokenizer.texts_to_sequences(df_combined['cleaned_text'])
+padded_sequences = pad_sequences(df_combined['token_sequence'], maxlen=MAX_SEQUENCE_LENGTH, padding='post')
+
+print("✅ Data prepared successfully!")
+print(df_combined.head())
